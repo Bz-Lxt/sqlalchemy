@@ -280,17 +280,23 @@ class ShardTest:
         bind_arguments = {}
 
         if limit_shard.none:
-            # right now selectinload / lazyload runs all the shards even if the
-            # ids are limited to just one shard, since that information
-            # is not transferred
-            counts = [2, 2, 2, 2]
+            # the lead query runs on all shards, but the relationship load
+            # is limited to the shard that contains the parent row itself,
+            # rather than scanning all shards
+            counts = [2, 1, 1, 1]
         elif limit_shard.lead_only:
             if option_type.selectinload:
+                # eager loaders always follow the shard of the parent rows
                 counts = [2, 0, 0, 0]
             else:
+                # propagate_to_loaders=False keeps the shard restriction
+                # off of lazy loaders; the lazy load falls back to the
+                # execute chooser, which queries all shards
                 counts = [2, 1, 1, 1]
         elif limit_shard.bind_arg:
-            counts = [2, 1, 1, 1]
+            # the relationship load follows the shard the parent row was
+            # loaded from
+            counts = [2, 0, 0, 0]
         elif limit_shard.propagate_to_loaders:
             counts = [2, 0, 0, 0]
         else:
@@ -361,6 +367,53 @@ class ShardTest:
         with self.assert_statement_count_multi_db(self.dbs, counts):
             w1 = sess.scalars(stmt, bind_arguments=bind_arguments).first()
             w1.continent
+
+    @testing.variation("option_type", ["lazyload", "selectinload"])
+    def test_relationship_load_targets_parent_shard(self, option_type):
+        """relationship loads follow the shard identity token of the
+        parent rows rather than scanning all shards.
+
+        Parent rows are present on all four shards.  The relationship load
+        must issue one statement per shard that contains parent rows,
+        against that same shard only.
+
+        """
+        sess = self._fixture_data()
+
+        if option_type.lazyload:
+            stmt = select(WeatherLocation).options(
+                lazyload(WeatherLocation.reports)
+            )
+            # one lead query per shard, plus one lazy load per parent on
+            # the shard that parent lives on
+            counts = [3, 2, 3, 3]
+        elif option_type.selectinload:
+            stmt = select(WeatherLocation).options(
+                selectinload(WeatherLocation.reports)
+            )
+            # one lead query per shard, plus one selectin secondary query
+            # per shard, each limited to that shard
+            counts = [2, 2, 2, 2]
+        else:
+            option_type.fail()
+
+        with self.assert_statement_count_multi_db(self.dbs, counts):
+            locations = sess.scalars(stmt).all()
+
+            if option_type.lazyload:
+                for location in locations:
+                    location.reports
+
+        by_city = {location.city: location for location in locations}
+
+        # the related rows are loaded from the correct shard - note that
+        # both Tokyo and New York have a Report with id 1, so loading
+        # across shards would mix the collections together
+        eq_({r.temperature for r in by_city["Tokyo"].reports}, {80.0})
+        eq_({r.temperature for r in by_city["New York"].reports}, {75})
+        eq_({r.temperature for r in by_city["Quito"].reports}, {85})
+        eq_(by_city["Toronto"].reports, [])
+        eq_(by_city["London"].reports, [])
 
     def test_query_explicit_shard_via_bind_opts(self):
         sess = self._fixture_data()

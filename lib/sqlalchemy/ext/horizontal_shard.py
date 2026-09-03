@@ -400,9 +400,24 @@ class set_shard_id(ORMOption):
 
     .. versionadded:: 2.0.0
 
+    .. versionchanged:: 2.1 the shard identifier used for relationship and
+       column loads is by default derived from the shard identifier of the
+       parent row being loaded, so that e.g. :func:`_orm.selectinload` and
+       lazy loads no longer scan all shards.  The
+       :paramref:`.set_shard_id.propagate_to_loaders` parameter may be used
+       to keep a shard restriction limited to the lead statement only.
+
     """
 
-    __slots__ = ("shard_id", "propagate_to_loaders")
+    __slots__ = ("shard_id", "_propagate_to_loaders")
+
+    # this option is always carried along to secondary loader queries
+    # (i.e. propagated_loader_options / state.load_options), even when
+    # the user requested it not to be applied to loaders.  In that case the
+    # option remains present so that the sharding execution hook is aware
+    # the restriction was explicitly limited to the lead statement, while
+    # the actual application decision is made at execution time.
+    propagate_to_loaders = True
 
     def __init__(
         self, shard_id: ShardIdentifier, propagate_to_loaders: bool = True
@@ -413,14 +428,16 @@ class set_shard_id(ORMOption):
         :param propagate_to_loaders: if left at its default of ``True``, the
          shard option will take place for lazy loaders such as
          :func:`_orm.lazyload` and :func:`_orm.defer`; if False, the option
-         will not be propagated to loaded objects. Note that :func:`_orm.defer`
-         always limits to the shard_id of the parent row in any case, so the
-         parameter only has a net effect on the behavior of the
-         :func:`_orm.lazyload` strategy.
+         will not be propagated to loaded objects, meaning the shard
+         restriction applies to the lead statement only.  Note that eager
+         loaders such as :func:`_orm.selectinload`, as well as
+         :func:`_orm.defer`, always limit to the shard id of the parent row
+         in any case, so the parameter only has a net effect on the
+         behavior of the :func:`_orm.lazyload` strategy.
 
         """
         self.shard_id = shard_id
-        self.propagate_to_loaders = propagate_to_loaders
+        self._propagate_to_loaders = propagate_to_loaders
 
 
 def execute_and_instances(
@@ -454,21 +471,67 @@ def execute_and_instances(
         orm_context.update_execution_options(identity_token=shard_id)
         return orm_context.invoke_statement(bind_arguments=bind_arguments)
 
+    # an explicitly set set_shard_id() option.  This is present on the
+    # lead statement as well as on secondary loader queries that received
+    # the option via loader option propagation.
+    shard_option: Optional[set_shard_id] = None
     for orm_opt in orm_context._non_compile_orm_options:
         # TODO: if we had an ORMOption that gets applied at ORM statement
         # execution time, that would allow this to be more generalized.
         # for now just iterate and look for our options
         if isinstance(orm_opt, set_shard_id):
-            shard_id = orm_opt.shard_id
+            shard_option = orm_opt
             break
+
+    is_relationship_load = orm_context.is_relationship_load
+    is_column_load = orm_context.is_column_load
+
+    if (
+        shard_option is not None
+        and not is_relationship_load
+        and not is_column_load
+    ):
+        # lead statement (including INSERT/UPDATE/DELETE): the option always
+        # determines the shard, regardless of propagate_to_loaders
+        shard_id: Optional[ShardIdentifier] = shard_option.shard_id
+    elif shard_option is not None and shard_option._propagate_to_loaders:
+        # a relationship or column load where the shard option was
+        # explicitly propagated to loaders
+        shard_id = shard_option.shard_id
     else:
+        # no explicit shard applies to this execution.  Relationship and
+        # column loads for an instance that itself was loaded from a
+        # specific shard carry the shard identifier (identity token) of
+        # that parent row; the secondary query is limited to that shard
+        # rather than scanning all shards.
         if active_options and active_options._identity_token is not None:
             shard_id = active_options._identity_token
+        elif "identity_token" in orm_context.execution_options:
+            shard_id = orm_context.execution_options["identity_token"]
+        elif (
+            is_relationship_load
+            and orm_context.lazy_loaded_from is not None
+            and orm_context.lazy_loaded_from.identity_token is not None
+        ):
+            shard_id = orm_context.lazy_loaded_from.identity_token
         elif "_sa_shard_id" in orm_context.execution_options:
             shard_id = orm_context.execution_options["_sa_shard_id"]
         elif "shard_id" in orm_context.bind_arguments:
             shard_id = orm_context.bind_arguments["shard_id"]
         else:
+            shard_id = None
+
+        if (
+            shard_option is not None
+            and shard_option._propagate_to_loaders is False
+            and orm_context.lazy_loaded_from is not None
+        ):
+            # the shard option explicitly stated that the shard restriction
+            # applies to the lead statement only and must not be propagated
+            # to lazy loaders.  Do not limit this lazy load to the parent
+            # row's shard; let the execute chooser decide which shards are
+            # queried.  Eager loaders such as selectinload() and column
+            # loads still follow the parent row's shard as above.
             shard_id = None
 
     if shard_id is not None:

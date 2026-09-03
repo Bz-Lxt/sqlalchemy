@@ -211,6 +211,19 @@ class QueryContext:
             if opt.propagate_to_loaders
         )
 
+        # non-compile-state options (e.g. execution-time options such as
+        # horizontal sharding's set_shard_id) are not part of the compiled
+        # / cached statement and therefore may be present on the
+        # user-passed statement but not on the cached statement.  These
+        # still need to propagate to loader queries if they request
+        # propagation.
+        if len(uncached_options) > len(cached_options):
+            self.propagated_loader_options += tuple(
+                uncached_opt
+                for uncached_opt in uncached_options[len(cached_options) :]
+                if uncached_opt.propagate_to_loaders
+            )
+
         self.attributes = dict(compile_state.attributes)
 
         self.autoflush = load_options._autoflush
